@@ -1,5 +1,5 @@
 // src/LandUseMap.jsx
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import {
   MapContainer,
   TileLayer,
@@ -10,79 +10,86 @@ import {
   useMapEvent
 } from "react-leaflet";
 import L from "leaflet";
-import area from "@turf/area";
-import circleTurf from "@turf/circle";
 import osmtogeojson from "osmtogeojson";
+import area from "@turf/area";
 import "leaflet/dist/leaflet.css";
 
-// Point of interest
+// POI + math
 const MARKER_COORD = [43.65063986776146, 11.463874101163523];
-// City center for distance tool
 const CITY_CENTER = L.latLng(43.7696, 11.2558);
-// Fertilizer math
-const RAW_MATERIAL_LITERS = 213070;
-const FERTILIZER_TOTAL = RAW_MATERIAL_LITERS * 0.07;
+const RAW_LITERS = 213070;
+const TOTAL_FERT = RAW_LITERS * 0.07;
 
-export default function LandUseMap() {
-  const [radiusKm, setRadiusKm] = useState(5);
-  const [geojson, setGeojson] = useState(null);
-  const [distance, setDistance] = useState(null);
+// Colour map
+const LANDUSE_COLORS = {
+  farmland: "#FFD700",
+  plantation: "#8B4513",
+  orchard: "#7FFF00",
+  vineyard: "#8B008B",
+  greenhouse_horticulture: "#00CED1"
+};
 
-  // Fetch and compute whenever radiusKm changes
+export default function LandUseMap({
+  radiusKm,
+  landuseToggles,
+  features = [],
+  onDataUpdate
+}) {
+  // Debounced fetch: waits 500ms after radius changes
   useEffect(() => {
-    const radiusM = radiusKm * 1000;
-    const [lat, lon] = MARKER_COORD;
+    const timer = setTimeout(() => {
+      const radiusM = radiusKm * 1000;
+      const [lat, lon] = MARKER_COORD;
+      const tags = Object.keys(LANDUSE_COLORS).join("|");
+      const query = `
+        [out:json][timeout:25];
+        way["landuse"~"${tags}"](around:${radiusM},${lat},${lon});
+        out body geom;
+      `;
+      fetch("https://overpass-api.de/api/interpreter?data=" + encodeURIComponent(query))
+        .then((r) => r.json())
+        .then((osmData) => {
+          const gj = osmtogeojson(osmData);
+          let totalArea = 0;
+          gj.features.forEach((f) => {
+            f.properties.area = area(f);
+            totalArea += f.properties.area;
+          });
+          gj.features.forEach((f) => {
+            f.properties.fertilizer = (f.properties.area / totalArea) * TOTAL_FERT;
+          });
+          onDataUpdate(gj.features);
+        })
+        .catch(console.error);
+    }, 500);
 
-    // Overpass query for farmland & plantation around the marker
-    const query = `
-      [out:json][timeout:25];
-      (
-        way["landuse"="farmland"](around:${radiusM},${lat},${lon});
-        way["landuse"="plantation"](around:${radiusM},${lat},${lon});
-      );
-      out body geom;
-    `;
-    fetch("https://overpass-api.de/api/interpreter?data=" + encodeURIComponent(query))
-      .then(r => r.json())
-      .then(osmData => {
-        const gj = osmtogeojson(osmData);
-        // calculate area & fertilizer share
-        let totalArea = 0;
-        gj.features.forEach(f => {
-          f.properties.area = area(f); // in m²
-          totalArea += f.properties.area;
-        });
-        gj.features.forEach(f => {
-          f.properties.fertilizer = (f.properties.area / totalArea) * FERTILIZER_TOTAL;
-        });
-        setGeojson(gj);
-      })
-      .catch(console.error);
-  }, [radiusKm]);
+    return () => clearTimeout(timer);
+  }, [radiusKm, onDataUpdate]);
 
-  // distance on map click
+  // Optional: measure distance on click
   function ClickDistance() {
-    useMapEvent("click", e => {
+    useMapEvent("click", (e) => {
       const d = CITY_CENTER.distanceTo(e.latlng) / 1000;
-      setDistance(d);
+      console.log(`Distance: ${d.toFixed(2)} km`);
     });
     return null;
   }
 
-  // style for plots
-  const stylePlot = feature => ({
-    fillColor: feature.properties.landuse === "farmland" ? "#FFD700" : "#8B4513",
+  // Style for each polygon
+  const stylePlot = (feature) => ({
+    fillColor: LANDUSE_COLORS[feature.properties.landuse] || "#ccc",
     weight: 1,
-    color: "#000",
-    fillOpacity: 0.5
+    color: "#555",
+    fillOpacity: 0.6
   });
 
-  // hover interactions
+  // Hover interactions
   const onEachFeature = (feature, layer) => {
     layer.on({
       mouseover: () => {
-        layer.setStyle({ weight: 3, fillOpacity: 0.8 });
+        layer.setStyle({ weight: 3, fillOpacity: 0.9 });
         layer.bindPopup(
+          `Type: ${feature.properties.landuse}<br/>` +
           `Area: ${(feature.properties.area / 1e6).toFixed(2)} km²<br/>` +
           `Fertilizer: ${feature.properties.fertilizer.toFixed(2)} L`
         ).openPopup();
@@ -94,103 +101,50 @@ export default function LandUseMap() {
     });
   };
 
+  // Only show toggled features
+  const visibleFeatures = features.filter(
+    (f) => landuseToggles[f.properties.landuse]
+  );
+
   return (
-    <>
-      {/* Radius input */}
-      <div style={{
-        position: "absolute", top: 10, left: 10, zIndex: 1000,
-        background: "#fff", padding: 8, borderRadius: 4,
-        boxShadow: "0 2px 6px rgba(0,0,0,0.2)"
-      }}>
-        <label>
-          Radius (km):{" "}
-          <input
-            type="number"
-            min="0"
-            step="0.5"
-            value={radiusKm}
-            onChange={e => setRadiusKm(Number(e.target.value))}
-            onKeyDown={e => e.key === "Enter" && e.target.blur()}
-            style={{ width: "4em" }}
-          />
-        </label>
-      </div>
+    <MapContainer
+      center={MARKER_COORD}
+      zoom={13}
+      style={{ height: "100vh", width: "100%" }}
+    >
+      {/* Base map: OSM streets, grayscale via CSS */}
+      <TileLayer
+        className="base-map"
+        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+        attribution="© OpenStreetMap contributors"
+      />
 
-      {/* Legend */}
-      <div style={{
-        position: "absolute", bottom: 10, left: 10, zIndex: 1000,
-        background: "#fff", padding: 8, borderRadius: 4,
-        boxShadow: "0 2px 6px rgba(0,0,0,0.2)"
-      }}>
-        <div>
-          <span style={{
-            display: "inline-block",
-            width: 12, height: 12,
-            background: "#FFD700",
-            marginRight: 6
-          }}/>Farmland
-        </div>
-        <div>
-          <span style={{
-            display: "inline-block",
-            width: 12, height: 12,
-            background: "#8B4513",
-            marginRight: 6
-          }}/>Plantation
-        </div>
-      </div>
-
-      {/* Distance display */}
-      <div style={{
-        position: "absolute", bottom: 10, right: 10, zIndex: 1000,
-        background: "#fff", padding: 8, borderRadius: 4,
-        boxShadow: "0 2px 6px rgba(0,0,0,0.2)"
-      }}>
-        {distance != null
-          ? `Distance from center: ${distance.toFixed(2)} km`
-          : "Click map to measure"}
-      </div>
-
-      <MapContainer
+      {/* Search radius */}
+      <Circle
         center={MARKER_COORD}
-        zoom={13}
-        style={{ height: "100vh", width: "100%" }}
-      >
-        {/* OSM tiles */}
-        <TileLayer
-          attribution='© OpenStreetMap contributors'
-          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+        radius={radiusKm * 1000}
+        pathOptions={{ color: "#666", fillOpacity: 0.1 }}
+      />
+
+      {/* POI Marker */}
+      <Marker position={MARKER_COORD}>
+        <Popup>
+          <strong>Arno Ovest</strong><br/>
+          Raw material: {RAW_LITERS} L<br/>
+          Total fertilizer: {TOTAL_FERT.toFixed(2)} L
+        </Popup>
+      </Marker>
+
+      {/* Land‐use overlays */}
+      {visibleFeatures.length > 0 && (
+        <GeoJSON
+          data={{ type: "FeatureCollection", features: visibleFeatures }}
+          style={stylePlot}
+          onEachFeature={onEachFeature}
         />
+      )}
 
-        {/* Search circle */}
-        <Circle
-          center={MARKER_COORD}
-          radius={radiusKm * 1000}
-          pathOptions={{ color: "blue", fillOpacity: 0.1 }}
-        />
-
-        {/* Marker */}
-        <Marker position={MARKER_COORD}>
-          <Popup>
-            <strong>Arno Ovest</strong><br/>
-            Fertilizer plant<br/>
-            Raw material: {RAW_MATERIAL_LITERS} L<br/>
-            Total fertilizer: {FERTILIZER_TOTAL.toFixed(2)} L
-          </Popup>
-        </Marker>
-
-        {/* Land-use plots */}
-        {geojson && (
-          <GeoJSON
-            key={radiusKm}
-            data={geojson}
-            style={stylePlot}
-            onEachFeature={onEachFeature}
-          />
-        )}
-
-        <ClickDistance />
-      </MapContainer>
-    </>
+      <ClickDistance />
+    </MapContainer>
   );
 }
